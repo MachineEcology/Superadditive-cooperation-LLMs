@@ -42,7 +42,8 @@ LLM = OllamaLLM(model="qwen3:14b")
 
 # 2-vs-1 Game Configuration
 TEAM_GAME_MODE = True  # Toggle between 1v1 and 2v1 modes
-DISCUSSION_TURNS = 3   # Number of pre-game coordination turns for Team 1
+DISCUSSION_TURNS = 3           # Number of pre-game strategizing turns for Team 1
+ADVERSARY_DISCUSSION_TURNS = 3 # Number of pre-game strategizing turns for Team 2 (adversary)
 TEAM1_SIZE = 2         # Number of agents in Team 1
 TEAM2_SIZE = 1         # Number of agents in Team 2
 
@@ -371,7 +372,7 @@ The current plan is:
 Provide a short review where you provide concrete improvements and suggestions.
 """)
 
-# %% 2-vs-1 Team Discussion Prompt
+# %% 2-vs-1 Discussion Prompts
 
 team_discussion_prompt = ChatPromptTemplate.from_template("""
 You are Agent {agent_id} in Team 1, a team of {team_size} agents playing against a single opponent (Team 2).
@@ -399,6 +400,32 @@ Share your strategic thinking with your teammate. Discuss:
 Remember: You will each choose your own action independently during the game, but you can coordinate strategy now.
 
 Respond with your message to your teammate (2-3 sentences).
+""")
+
+adversary_discussion_prompt = ChatPromptTemplate.from_template("""
+You are Agent {agent_id}, the sole adversary (Team 2) in a 2-vs-1 strategic game.
+
+You are playing ALONE against a coordinated team of 2 agents (Team 1).
+
+This is your PRE-GAME STRATEGIZING phase (Turn {current_turn} of {max_turns}).
+
+Game Rules:
+{game_rules}
+
+Previous thoughts (if any):
+{previous_thoughts}
+
+Outcome of the previous game (if any):
+{previous_game_outcome}
+
+Task:
+Think through your strategy against the coordinated team. Consider:
+1. What action (action_a or action_b) should you choose, and why?
+2. How might Team 1 coordinate their moves against you?
+3. How should you respond to different Team 1 combinations?
+4. What is your goal: maximize your own score?
+
+Respond with your strategic thoughts (2-3 sentences).
 """)
 
 
@@ -697,6 +724,133 @@ def format_team_match_results_team2(match: MatchState) -> str:
             )
 
     return "\n".join(results) if results else "No rounds played yet."
+
+
+def run_adversary_discussion(state: MatchState, previous_game_outcome: str, max_turns: int) -> str:
+    """
+    Run a solo strategizing phase for the Team 2 adversary before each game.
+    The adversary thinks through their strategy across max_turns iterations.
+
+    Returns: Adversary's strategy plan summary
+    """
+    llm = LLM
+    agent_id = state.team2_member_id
+
+    print(f"\n{'='*60}")
+    print(f"TEAM 2 (ADVERSARY) STRATEGIZING PHASE ({max_turns} turns)")
+    print(f"{'='*60}")
+
+    thoughts = []
+
+    for turn in range(max_turns):
+        previous_text = "\n".join([
+            f"Turn {t['turn']+1}: {t['message']}" for t in thoughts
+        ]) if thoughts else "No previous thoughts yet."
+
+        prompt = adversary_discussion_prompt.format(
+            agent_id=agent_id,
+            current_turn=turn + 1,
+            max_turns=max_turns,
+            game_rules=format_game_rules_2v1(0, 0),
+            previous_thoughts=previous_text,
+            previous_game_outcome=previous_game_outcome,
+        )
+
+        response = llm.invoke(prompt)
+        response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+
+        thoughts.append({'turn': turn, 'message': response})
+
+        print(f"\nTurn {turn+1} - Adversary Agent {agent_id}:")
+        print(f"  {response}")
+
+    # The final thought becomes the adversary's plan
+    final_plan = thoughts[-1]['message'] if thoughts else "No strategy formed."
+    state.team2_stats.plan = final_plan
+
+    print(f"\n{'='*60}")
+    print(f"ADVERSARY PLAN: {final_plan}")
+    print(f"{'='*60}\n")
+
+    return final_plan
+
+
+def compute_empirical_frequencies(match: MatchState) -> Dict[str, Any]:
+    """
+    Compute empirical action frequencies and joint outcome probabilities for a match.
+
+    Returns a dict with:
+    - 'team1_agent1_action_a_rate': fraction of action_a for Team 1 agent 1
+    - 'team1_agent2_action_a_rate': fraction of action_a for Team 1 agent 2
+    - 'team2_action_a_rate': fraction of action_a for Team 2
+    - 'joint_outcome_counts': raw counts for all 8 (a1, a2, t2) combinations
+    - 'joint_outcome_frequencies': normalized frequencies for all 8 combinations
+    - 'team1_joint_counts': counts for Team 1 joint actions (a,a), (a,b), (b,a), (b,b)
+    - 'team1_joint_frequencies': normalized frequencies for Team 1 joint actions
+    """
+    if not match.round_results:
+        return {}
+
+    agent1_id = match.team1_member_ids[0]
+    agent2_id = match.team1_member_ids[1]
+
+    n = len(match.round_results)
+
+    # Marginal action counts
+    a1_a_count = sum(1 for r in match.round_results if isinstance(r, dict) and r['team1'][agent1_id] == 'action_a')
+    a2_a_count = sum(1 for r in match.round_results if isinstance(r, dict) and r['team1'][agent2_id] == 'action_a')
+    t2_a_count = sum(1 for r in match.round_results if isinstance(r, dict) and r['team2'] == 'action_a')
+
+    # Joint outcome counts over all 8 combinations
+    combinations_keys = [
+        ('action_a', 'action_a', 'action_a'),
+        ('action_a', 'action_a', 'action_b'),
+        ('action_a', 'action_b', 'action_a'),
+        ('action_a', 'action_b', 'action_b'),
+        ('action_b', 'action_a', 'action_a'),
+        ('action_b', 'action_a', 'action_b'),
+        ('action_b', 'action_b', 'action_a'),
+        ('action_b', 'action_b', 'action_b'),
+    ]
+
+    joint_counts = {}
+    for key in combinations_keys:
+        a1m, a2m, t2m = key
+        count = sum(
+            1 for r in match.round_results
+            if isinstance(r, dict)
+            and r['team1'][agent1_id] == a1m
+            and r['team1'][agent2_id] == a2m
+            and r['team2'] == t2m
+        )
+        label = f"({a1m.replace('action_', '')},{a2m.replace('action_', '')},{t2m.replace('action_', '')})"
+        joint_counts[label] = count
+
+    joint_frequencies = {k: v / n for k, v in joint_counts.items()}
+
+    # Team 1 joint action counts (collapsing Team 2)
+    team1_joint_labels = {'(a,a)': ('action_a', 'action_a'), '(a,b)': ('action_a', 'action_b'),
+                          '(b,a)': ('action_b', 'action_a'), '(b,b)': ('action_b', 'action_b')}
+    team1_joint_counts = {}
+    for label, (a1m, a2m) in team1_joint_labels.items():
+        team1_joint_counts[label] = sum(
+            1 for r in match.round_results
+            if isinstance(r, dict)
+            and r['team1'][agent1_id] == a1m
+            and r['team1'][agent2_id] == a2m
+        )
+    team1_joint_frequencies = {k: v / n for k, v in team1_joint_counts.items()}
+
+    return {
+        'num_rounds': n,
+        'team1_agent1_action_a_rate': a1_a_count / n,
+        'team1_agent2_action_a_rate': a2_a_count / n,
+        'team2_action_a_rate': t2_a_count / n,
+        'joint_outcome_counts': joint_counts,
+        'joint_outcome_frequencies': joint_frequencies,
+        'team1_joint_counts': team1_joint_counts,
+        'team1_joint_frequencies': team1_joint_frequencies,
+    }
 
 
 # %% LLM calls
@@ -1305,10 +1459,20 @@ def start_round_2v1(state: TournamentState):
 
 
 def team_discussion_node(state: TournamentState):
-    """Run team discussion (only on first round)."""
+    """Run team discussion (only on first round of each game)."""
     match = state.matches[state.current_match_idx]
     if match.current_round == 1 and DISCUSSION_TURNS > 0:
         run_team_discussion(match, state, DISCUSSION_TURNS)
+    return {"matches": {state.current_match_idx: match}}
+
+
+def adversary_discussion_node(state: TournamentState):
+    """Run adversary solo strategizing phase (only on first round of each game)."""
+    match = state.matches[state.current_match_idx]
+    if match.current_round == 1 and ADVERSARY_DISCUSSION_TURNS > 0:
+        # Summarise previous game outcome for context (empty string on the first ever game)
+        previous_game_outcome = match.team2_stats.plan if match.team2_stats.plan != "No plan yet" else "No previous game."
+        run_adversary_discussion(match, previous_game_outcome, ADVERSARY_DISCUSSION_TURNS)
     return {"matches": {state.current_match_idx: match}}
 
 
@@ -1458,12 +1622,26 @@ def create_tournament_graph():
 
 
 def create_tournament_graph_2v1():
-    """Create LangGraph workflow for 2-vs-1 team game."""
+    """Create LangGraph workflow for 2-vs-1 team game.
+
+    First-round flow (discussion phase):
+        start_round → team_discussion → adversary_discussion → fan-out to planning nodes
+
+    Subsequent rounds (no discussion):
+        start_round → fan-out to planning nodes directly
+    """
     workflow = StateGraph(TournamentState)
+
+    # Add a synchronisation node that all planning branches start from
+    def begin_gameplay(_state: TournamentState):
+        """No-op sync node: gameplay begins after all discussion phases."""
+        return {}
 
     # Add nodes
     workflow.add_node("start_round", start_round_2v1)
     workflow.add_node("team_discussion", team_discussion_node)
+    workflow.add_node("adversary_discussion", adversary_discussion_node)
+    workflow.add_node("begin_gameplay", begin_gameplay)
     workflow.add_node("team1_agent1_plan", team1_agent1_plan)
     workflow.add_node("team1_agent1_move", team1_agent1_move)
     workflow.add_node("team1_agent2_plan", team1_agent2_plan)
@@ -1475,30 +1653,30 @@ def create_tournament_graph_2v1():
     # Entry point
     workflow.set_entry_point("start_round")
 
-    # Conditional: Run discussion only on first round
+    # Conditional: Run discussion phases only on the first round of each match
     def should_discuss(state: TournamentState) -> str:
         match = state.matches[state.current_match_idx]
         if match.current_round == 1 and not match.discussion_history:
             return "team_discussion"
-        return "team1_agent1_plan"
+        return "begin_gameplay"
 
     workflow.add_conditional_edges("start_round", should_discuss, {
         "team_discussion": "team_discussion",
-        "team1_agent1_plan": "team1_agent1_plan"
+        "begin_gameplay": "begin_gameplay",
     })
 
-    # After discussion, proceed to planning
-    workflow.add_edge("team_discussion", "team1_agent1_plan")
+    # Sequential discussion: Team 1 discusses → Team 2 strategizes → gameplay
+    workflow.add_edge("team_discussion", "adversary_discussion")
+    workflow.add_edge("adversary_discussion", "begin_gameplay")
 
-    # Team 1 parallel planning and moves
+    # Fan out from begin_gameplay to all parallel planning nodes
+    workflow.add_edge("begin_gameplay", "team1_agent1_plan")
+    workflow.add_edge("begin_gameplay", "team1_agent2_plan")
+    workflow.add_edge("begin_gameplay", "team2_plan")
+
+    # Planning → move generation
     workflow.add_edge("team1_agent1_plan", "team1_agent1_move")
     workflow.add_edge("team1_agent2_plan", "team1_agent2_move")
-
-    # Also start Team 1 Agent 2 planning in parallel
-    workflow.add_edge("start_round", "team1_agent2_plan")
-
-    # Team 2 planning in parallel
-    workflow.add_edge("start_round", "team2_plan")
     workflow.add_edge("team2_plan", "team2_move")
 
     # All moves feed into play_round
